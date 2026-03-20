@@ -1,0 +1,22 @@
+# Config (contains API credentials — never commit)
+extract_config.ini
+
+# Output data
+attendance_data/
+*.csv
+
+# Generated Excel report
+BB_Global_Attendance_Report.xlsx
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
