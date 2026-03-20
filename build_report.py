@@ -476,7 +476,9 @@ def build_dashboard(wb, course_data, student_data):
 
     # Subtitle
     ws.merge_cells("B3:K3")
-    sub = ws.cell(row=3, column=2, value=f"Spring 2026  |  Generated {datetime.now().strftime('%d %b %Y %H:%M')}")
+    # Pull the term name from the data instead of hardcoding
+    term_label = course_data[0]["term"] if course_data else "Unknown Term"
+    sub = ws.cell(row=3, column=2, value=f"{term_label}  |  Generated {datetime.now().strftime('%d %b %Y %H:%M')}")
     sub.font = FONT_SMALL
     sub.alignment = Alignment(horizontal="left", vertical="center")
 
@@ -1379,6 +1381,210 @@ def build_config(wb):
     return ws
 
 
+# ── Pivot Tables (built from actual data) ────────────────────────────────────
+
+def build_risk_pivot(wb, student_data):
+    """Build the Risk Pivot sheet: Department × Risk Band cross-tab."""
+    ws = wb.create_sheet("Risk Pivot")
+    ws.sheet_properties.tabColor = RED_RISK
+
+    # Column A spacer
+    set_col_width(ws, 1, 3)
+
+    # Title
+    ws.merge_cells("B2:G2")
+    ws.cell(row=2, column=2, value="Student Risk Distribution by Department").font = FONT_TITLE
+    ws.row_dimensions[2].height = 30
+
+    # Gather unique departments and risk bands from data
+    risk_bands = ["OK", "Medium Risk", "High Risk", "No Data"]
+    depts = sorted(set(s["dept"] for s in student_data if s.get("dept")))
+    if not depts:
+        depts = ["(No Department)"]
+
+    # Count students per department per risk band
+    counts = {}  # dept -> {band -> count}
+    for s in student_data:
+        d = s.get("dept", "") or "(No Department)"
+        b = s.get("risk_band", "No Data")
+        if d not in counts:
+            counts[d] = {rb: 0 for rb in risk_bands}
+        if b not in counts[d]:
+            counts[d][b] = 0
+        counts[d][b] += 1
+
+    # Header row
+    row = 4
+    headers = ["Department"] + risk_bands + ["Total"]
+    for i, h in enumerate(headers):
+        ws.cell(row=row, column=2 + i, value=h)
+    style_header_row(ws, row, 2, 2 + len(headers) - 1)
+    row += 1
+
+    # Data rows
+    data_start = row
+    for dept in sorted(counts.keys()):
+        ws.cell(row=row, column=2, value=dept).font = FONT_BODY
+        ws.cell(row=row, column=2).alignment = ALIGN_LEFT
+        total = 0
+        for j, band in enumerate(risk_bands):
+            val = counts[dept].get(band, 0)
+            total += val
+            c = ws.cell(row=row, column=3 + j, value=val)
+            c.font = FONT_BODY
+            c.alignment = ALIGN_CENTER
+            c.number_format = "#,##0"
+        c = ws.cell(row=row, column=3 + len(risk_bands), value=total)
+        c.font = Font(name="Calibri", size=11, bold=True)
+        c.alignment = ALIGN_CENTER
+        c.number_format = "#,##0"
+        for col in range(2, 3 + len(risk_bands) + 1):
+            ws.cell(row=row, column=col).border = THIN_BORDER
+        row += 1
+    data_end = row - 1
+
+    # Totals row
+    ws.cell(row=row, column=2, value="Total").font = Font(name="Calibri", size=11, bold=True)
+    grand = 0
+    for j, band in enumerate(risk_bands):
+        col_total = sum(counts[d].get(band, 0) for d in counts)
+        grand += col_total
+        c = ws.cell(row=row, column=3 + j, value=col_total)
+        c.font = Font(name="Calibri", size=11, bold=True)
+        c.alignment = ALIGN_CENTER
+        c.number_format = "#,##0"
+    c = ws.cell(row=row, column=3 + len(risk_bands), value=grand)
+    c.font = Font(name="Calibri", size=11, bold=True)
+    c.alignment = ALIGN_CENTER
+    c.number_format = "#,##0"
+    for col in range(2, 3 + len(risk_bands) + 1):
+        ws.cell(row=row, column=col).border = BOTTOM_THICK
+
+    # Conditional formatting — color the risk columns
+    # High Risk column in red tones
+    high_col = get_column_letter(3 + risk_bands.index("High Risk"))
+    ws.conditional_formatting.add(
+        f"{high_col}{data_start}:{high_col}{data_end}",
+        DataBarRule(start_type="min", end_type="max", color=RED_RISK)
+    )
+    # Medium Risk in orange
+    med_col = get_column_letter(3 + risk_bands.index("Medium Risk"))
+    ws.conditional_formatting.add(
+        f"{med_col}{data_start}:{med_col}{data_end}",
+        DataBarRule(start_type="min", end_type="max", color=ORANGE)
+    )
+    # OK in green
+    ok_col = get_column_letter(3 + risk_bands.index("OK"))
+    ws.conditional_formatting.add(
+        f"{ok_col}{data_start}:{ok_col}{data_end}",
+        DataBarRule(start_type="min", end_type="max", color=GREEN_OK)
+    )
+
+    # Column widths
+    set_col_width(ws, 2, 30)
+    for i in range(len(risk_bands) + 1):
+        set_col_width(ws, 3 + i, 16)
+
+    ws.freeze_panes = "C5"
+    return ws
+
+
+def build_instructor_pivot(wb, course_data):
+    """Build the Instructor Pivot sheet: Department → Instructor → Avg Attendance."""
+    ws = wb.create_sheet("Instructor Pivot")
+    ws.sheet_properties.tabColor = TEAL
+
+    # Column A spacer
+    set_col_width(ws, 1, 3)
+
+    # Title
+    ws.merge_cells("B2:G2")
+    ws.cell(row=2, column=2, value="Attendance by Instructor").font = FONT_TITLE
+    ws.row_dimensions[2].height = 30
+
+    # Aggregate: department → instructor → list of course avg rates
+    instructor_stats = {}  # dept -> {instructor -> {rates:[], students:0, courses:0}}
+    for c in course_data:
+        d = c.get("dept", "") or "(No Department)"
+        inst = c.get("instructor", "") or "(No Instructor)"
+        if d not in instructor_stats:
+            instructor_stats[d] = {}
+        if inst not in instructor_stats[d]:
+            instructor_stats[d][inst] = {"rates": [], "students": 0, "courses": 0}
+        instructor_stats[d][inst]["courses"] += 1
+        instructor_stats[d][inst]["students"] += c.get("total_students", 0)
+        if c.get("avg_attendance_pct") is not None:
+            instructor_stats[d][inst]["rates"].append(c["avg_attendance_pct"])
+
+    # Header row
+    row = 4
+    headers = ["Department", "Instructor", "Courses", "Students", "Avg Attendance %"]
+    for i, h in enumerate(headers):
+        ws.cell(row=row, column=2 + i, value=h)
+    style_header_row(ws, row, 2, 6)
+    row += 1
+
+    # Data rows grouped by department
+    data_start = row
+    for dept in sorted(instructor_stats.keys()):
+        instructors = instructor_stats[dept]
+        first_in_dept = True
+        for inst in sorted(instructors.keys()):
+            stats = instructors[inst]
+            avg = round(sum(stats["rates"]) / len(stats["rates"]), 2) if stats["rates"] else None
+
+            # Show department name only on first row of each group
+            if first_in_dept:
+                ws.cell(row=row, column=2, value=dept).font = Font(name="Calibri", size=11, bold=True)
+                ws.cell(row=row, column=2).alignment = ALIGN_LEFT
+                first_in_dept = False
+            else:
+                ws.cell(row=row, column=2, value="").font = FONT_BODY
+
+            ws.cell(row=row, column=3, value=inst).font = FONT_BODY
+            ws.cell(row=row, column=3).alignment = ALIGN_LEFT
+
+            c = ws.cell(row=row, column=4, value=stats["courses"])
+            c.font = FONT_BODY
+            c.alignment = ALIGN_CENTER
+            c.number_format = "#,##0"
+
+            c = ws.cell(row=row, column=5, value=stats["students"])
+            c.font = FONT_BODY
+            c.alignment = ALIGN_CENTER
+            c.number_format = "#,##0"
+
+            if avg is not None:
+                c = ws.cell(row=row, column=6, value=round(avg / 100, 4))
+                c.number_format = "0.0%"
+            else:
+                c = ws.cell(row=row, column=6, value="N/A")
+            c.font = FONT_BODY
+            c.alignment = ALIGN_CENTER
+
+            for col in range(2, 7):
+                ws.cell(row=row, column=col).border = THIN_BORDER
+            row += 1
+    data_end = row - 1
+
+    # Attendance % data bars
+    if data_end >= data_start:
+        ws.conditional_formatting.add(
+            f"F{data_start}:F{data_end}",
+            DataBarRule(start_type="min", end_type="max", color=TEAL)
+        )
+
+    # Column widths
+    set_col_width(ws, 2, 30)
+    set_col_width(ws, 3, 28)
+    set_col_width(ws, 4, 12)
+    set_col_width(ws, 5, 12)
+    set_col_width(ws, 6, 20)
+
+    ws.freeze_panes = "C5"
+    return ws
+
+
 # ── Main Build ───────────────────────────────────────────────────────────────
 
 def load_csv_data():
@@ -1544,6 +1750,12 @@ def main():
 
     print("  Building Compliance...")
     build_compliance(wb, compliance_data)
+
+    print("  Building Risk Pivot...")
+    build_risk_pivot(wb, student_data)
+
+    print("  Building Instructor Pivot...")
+    build_instructor_pivot(wb, course_data)
 
     print("  Building Data Model docs...")
     build_data_model(wb)
