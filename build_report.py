@@ -342,7 +342,7 @@ def generate_sample_data():
                 "absent": s_absent,
                 "excused": 0,
                 "attendance_pct": rate,
-                "last_attendance": s_last,
+                "last_attendance_date": s_last,
                 "risk_band": band,
                 "below_threshold": "Yes" if rate is not None and rate < 75 else ("N/A" if rate is None else "No"),
             })
@@ -892,7 +892,7 @@ def build_student_detail(wb, data):
             row_data["absent"],
             row_data["excused"],
             row_data["attendance_pct"] / 100 if row_data["attendance_pct"] is not None else "",
-            row_data["last_attendance"],
+            row_data["last_attendance_date"],
             row_data["risk_band"],
             row_data["below_threshold"],
         ]
@@ -1705,13 +1705,13 @@ def load_csv_data():
             "course_name": r.get("course_name", ""),
             "instructor": r.get("instructor", ""),
             "total_meetings": to_int(r.get("total_meetings")),
-            "total_attendance_records": to_int(r.get("total_attendance_records")),
+            "total_records": to_int(r.get("total_attendance_records")),
             "last_attendance_date": r.get("last_attendance_date", ""),
             "days_since_last": to_int(r.get("days_since_last")) if r.get("days_since_last") else None,
             "status": r.get("status", ""),
             "api_blocked": to_bool(r.get("api_blocked")),
             "no_attendance_recorded": to_bool(r.get("no_attendance_recorded")),
-            "attendance_not_recent": to_bool(r.get("attendance_not_recent")),
+            "not_recent": to_bool(r.get("attendance_not_recent")),
         })
 
     return course_data, student_data, daily_data, compliance_data
