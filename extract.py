@@ -67,7 +67,7 @@ OUTPUT_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attendan
 
 DEFAULT_THRESHOLD = 75          # Attendance % below which students are flagged
 STALE_DAYS        = 14          # Days since last attendance to flag as "Stale"
-MAX_WORKERS       = 10          # Parallel API threads
+MAX_WORKERS       = 4           # Parallel API threads (keep low to avoid 429s)
 
 # ── Institutional Hierarchy ──────────────────────────────────────────────────
 # The "All Departments" parent node ID in Blackboard's Institutional Hierarchy.
@@ -134,10 +134,22 @@ class BlackboardAPI:
         print(f"[Auth] Token acquired from {self.base_url}")
 
     def _get(self, path, params=None):
-        """Authenticated GET request."""
+        """Authenticated GET request with automatic 429 retry."""
         url = f"{self.base_url}{path}"
         headers = {"Authorization": f"Bearer {self.token}"}
-        resp = self.session.get(url, headers=headers, params=params, timeout=30)
+        max_retries = 5
+        for attempt in range(max_retries):
+            resp = self.session.get(url, headers=headers, params=params, timeout=30)
+            if resp.status_code == 429:
+                # Rate limited — read Retry-After header or default to 60s
+                wait = int(resp.headers.get("Retry-After", 60))
+                wait = min(wait, 300)  # Cap at 5 minutes
+                print(f"  [Rate Limit] 429 on {path[:60]}... waiting {wait}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        # Final attempt — let it raise if still 429
         resp.raise_for_status()
         return resp.json()
 
