@@ -142,7 +142,9 @@ class BlackboardAPI:
             resp = self.session.get(url, headers=headers, params=params, timeout=30)
             if resp.status_code == 429:
                 # Rate limited — read Retry-After header or default to 60s
-                wait = int(resp.headers.get("Retry-After", 60))
+                raw_retry = resp.headers.get("Retry-After", "60")
+                # Strip non-numeric chars (BB sometimes sends '85166s')
+                wait = int(''.join(c for c in str(raw_retry) if c.isdigit()) or '60')
                 wait = min(wait, 300)  # Cap at 5 minutes
                 print(f"  [Rate Limit] 429 on {path[:60]}... waiting {wait}s (attempt {attempt+1}/{max_retries})")
                 time.sleep(wait)
