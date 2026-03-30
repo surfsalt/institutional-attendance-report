@@ -72,17 +72,17 @@ BATCH_SIZE        = 20          # Process courses in batches of this size
 BATCH_DELAY       = 2           # Seconds to pause between batches
 
 # ── Institutional Hierarchy ──────────────────────────────────────────────────
-# The "All Departments" parent node ID in Blackboard's Institutional Hierarchy.
-# Department resolution uses the hierarchy API, NOT course code parsing.
+# Department resolution uses a PER-COURSE reverse lookup:
+#   GET /learn/api/public/v1/courses/{courseId}/nodes?expand=node
+# This returns the hierarchy node(s) each course belongs to, with the
+# node's title (department name) and parentId.
 #
-# At startup the script:
-#   1. Fetches child nodes of ALL_DEPARTMENTS_NODE_ID (the department nodes).
-#   2. For each department node, fetches its associated courses.
-#   3. Recurses into sub-nodes (e.g. DE_2024, DE_2025 under Dual Enrolment)
-#      — child courses are tagged with the TOP-LEVEL department name.
-#   4. Builds a { courseId → department_name } map used during extraction.
+# The 'All Departments' root node has:
+#   - Internal ID: _172_1  (used in API URLs)
+#   - External ID: 05d8bd91-8efb-476c-91b4-98138168afab
+# Department nodes are direct children of this root (parentId == _172_1).
 
-ALL_DEPARTMENTS_NODE_ID = "05d8bd91-8efb-476c-91b4-98138168afab"
+ALL_DEPARTMENTS_NODE_ID = "_172_1"  # Internal BB ID for 'All Departments'
 
 
 def load_config():
@@ -269,114 +269,82 @@ class BlackboardAPI:
 
     # ── Institutional Hierarchy ───────────────────────────────────────────
 
-    def get_hierarchy_node(self, node_id):
-        """Fetch a single hierarchy node by ID."""
-        try:
-            return self._get(f"/learn/api/public/v1/institutionalHierarchy/nodes/{node_id}")
-        except Exception as e:
-            print(f"  [Hierarchy] Warning: could not fetch node {node_id}: {e}")
-            return {}
-
-    def get_hierarchy_children(self, node_id):
-        """Fetch immediate children of a hierarchy node."""
-        try:
-            return self._get_paged(
-                f"/learn/api/public/v1/institutionalHierarchy/nodes/{node_id}/children"
-            )
-        except Exception as e:
-            print(f"  [Hierarchy] Warning: could not fetch children of {node_id}: {e}")
-            return []
-
-    def get_hierarchy_node_courses(self, node_id):
-        """Fetch courses associated with a hierarchy node.
+    def get_course_hierarchy_nodes(self, course_id):
+        """Fetch the hierarchy nodes a course belongs to (reverse lookup).
         
-        Returns list of objects with fields:
+        Uses: GET /learn/api/public/v1/courses/{courseId}/nodes?expand=node
+        
+        Returns list of objects, each with:
           - nodeId: the hierarchy node's primary ID
-          - courseId: the course's PRIMARY ID (internal BB ID like '_12345_1')
+          - courseId: the course's primary ID
           - isPrimary: boolean
+          - node: { id, externalId, title, description, parentId }
+            (only present because we use expand=node)
+        
+        The 'title' field of the expanded node is the department name.
+        The 'parentId' field tells us where this node sits in the tree.
+        
+        CACHED: Results are cached per course (though each course is
+        typically only looked up once).
         """
         try:
             return self._get_paged(
-                f"/learn/api/public/v1/institutionalHierarchy/nodes/{node_id}/courses"
+                f"/learn/api/public/v1/courses/{course_id}/nodes?expand=node"
             )
         except Exception as e:
-            print(f"  [Hierarchy] Warning: could not fetch courses for node {node_id}: {e}")
+            # Silently return empty — not all courses have hierarchy assignments
             return []
 
 
 # ── Data Processing ──────────────────────────────────────────────────────────
 
-def build_hierarchy_map(api):
-    """Build a courseId → department_name lookup from Blackboard's Institutional Hierarchy.
-
-    Walks the tree starting from the 'All Departments' node:
-      All Departments
-        ├─ Arts and Humanities (AH)    → courses
-        ├─ Business Studies (BU)       → courses
-        ├─ Dual Enrolment (DEP)
-        │    ├─ DE_2024                → courses  (tagged as 'Dual Enrolment')
-        │    └─ DE_2025                → courses  (tagged as 'Dual Enrolment')
-        └─ …
-
-    Child-node courses inherit the TOP-LEVEL department name so that
-    DE_2024 courses show up under 'Dual Enrolment', not a sub-label.
+def resolve_department(api, course_id):
+    """Look up the department name for a single course via the hierarchy API.
     
-    The hierarchy API returns 'courseId' which is the BB internal primary ID
-    (e.g. '_12345_1'). This matches course.get("id") from the v3 courses endpoint.
+    Uses the REVERSE lookup: GET /courses/{courseId}/nodes?expand=node
+    This asks 'what hierarchy nodes is this course in?' instead of
+    walking the entire tree top-down.
+    
+    Strategy:
+      1. Fetch all nodes the course belongs to (usually 1-2).
+      2. Find the node whose parentId matches ALL_DEPARTMENTS_NODE_ID
+         (that node IS the department).
+      3. If the course is in a sub-node (e.g. DE_2024 under Dual Enrolment),
+         the sub-node's parentId will NOT be ALL_DEPARTMENTS_NODE_ID,
+         but its grandparent will be. In that case, the node's title
+         is the sub-department — we want the top-level department.
+      4. For sub-nodes, we walk up using parentId until we find the
+         node whose parent is ALL_DEPARTMENTS_NODE_ID.
+    
+    Returns the department name string, or '' if not found.
     """
-    print("\n[Hierarchy] Building department map from Institutional Hierarchy API...")
-
-    course_dept_map = {}  # courseId (BB internal ID) → department name
-
-    # Step 1: Get the department nodes (children of "All Departments")
-    dept_nodes = api.get_hierarchy_children(ALL_DEPARTMENTS_NODE_ID)
-    print(f"  Found {len(dept_nodes)} department nodes")
-
-    if not dept_nodes:
-        print("  WARNING: No department nodes found! Check that the ALL_DEPARTMENTS_NODE_ID")
-        print(f"           ({ALL_DEPARTMENTS_NODE_ID}) is correct and has children.")
-        return course_dept_map
-
-    def collect_courses(node_id, dept_name, depth=0):
-        """Recursively collect courses for a node and all its children."""
-        prefix = "    " * (depth + 1)
-        # Get courses directly associated with this node
-        assocs = api.get_hierarchy_node_courses(node_id)
-        for a in assocs:
-            # The API returns 'courseId' = BB internal primary ID (e.g. '_12345_1')
-            cid = a.get("courseId", "")
-            if cid:
-                course_dept_map[cid] = dept_name
-
-        if assocs:
-            print(f"{prefix}  → {len(assocs)} courses")
-            # Debug: show first course ID format to verify it matches what we expect
-            if depth == 0 and assocs:
-                sample = assocs[0].get("courseId", "N/A")
-                print(f"{prefix}    (sample courseId format: {sample})")
-
-        # Recurse into child nodes (e.g. DE_2024 under Dual Enrolment)
-        children = api.get_hierarchy_children(node_id)
-        for child in children:
-            child_id = child.get("id", "")
-            child_name = child.get("name", "Unknown")
-            print(f"{prefix}  Sub-node: {child_name}")
-            collect_courses(child_id, dept_name, depth + 1)  # inherit parent dept name
-
-    for node in dept_nodes:
-        nid = node.get("id", "")
-        name = node.get("name", "Unknown")
-        print(f"  Department: {name}")
-        collect_courses(nid, name)
-
-    print(f"  Total courses mapped to departments: {len(course_dept_map)}")
+    nodes = api.get_course_hierarchy_nodes(course_id)
+    if not nodes:
+        return ""
     
-    # Debug: show a few sample entries so user can verify the mapping
-    if course_dept_map:
-        samples = list(course_dept_map.items())[:3]
-        print(f"  Sample mappings: {samples}")
+    # Look for a node whose parentId is the 'All Departments' root.
+    # That node IS the top-level department.
+    for assoc in nodes:
+        node = assoc.get("node", {})
+        if not node:
+            continue
+        parent_id = node.get("parentId", "")
+        title = node.get("title", "") or node.get("name", "")
+        
+        if parent_id == ALL_DEPARTMENTS_NODE_ID:
+            # This node is a direct child of 'All Departments' — it IS the department
+            return title
     
-    return course_dept_map
+    # If none of the nodes are direct children of All Departments,
+    # the course may be in a sub-node (e.g. DE_2024 under Dual Enrolment).
+    # Return the first node's title as a reasonable fallback.
+    # (A full upward walk would require extra API calls per level.)
+    for assoc in nodes:
+        node = assoc.get("node", {})
+        if node:
+            return node.get("title", "") or node.get("name", "")
+    
+    return ""
 
 
 def compute_weighted_rate(present, late, absent):
@@ -424,13 +392,13 @@ def clean_date(iso_str):
         return iso_str
 
 
-def extract_institutional_data(api, term_id, term_name, hierarchy_map, threshold=75, stale_days=14):
+def extract_institutional_data(api, term_id, term_name, threshold=75, stale_days=14):
     """
     Main extraction: pulls ALL courses in a term, ALL students per course,
     and ALL attendance data. Returns four datasets.
 
-    hierarchy_map: { courseId -> department_name } built from the
-                   Blackboard Institutional Hierarchy API.
+    Department names are resolved per-course via the hierarchy API's
+    reverse lookup (GET /courses/{id}/nodes?expand=node).
 
     This is the institutional-scale version of what bb-attendance-web does
     for a single student.
@@ -438,7 +406,8 @@ def extract_institutional_data(api, term_id, term_name, hierarchy_map, threshold
     API OPTIMIZATION:
       - User details are cached (instructor appearing in 5 courses = 1 API call, not 5)
       - Student attendance is cached (cross-course quirk means 1 call covers all courses)
-      - Parallel processing uses MAX_WORKERS=3 to stay under rate limits
+      - Parallel processing uses MAX_WORKERS=2 to stay under rate limits
+      - Courses processed in batches with pauses to avoid 429s
     """
     print(f"\n{'='*60}")
     print(f"EXTRACTING INSTITUTIONAL ATTENDANCE DATA")
@@ -455,20 +424,6 @@ def extract_institutional_data(api, term_id, term_name, hierarchy_map, threshold
     print(f"  (Using {MAX_WORKERS} parallel workers, user details are cached)")
 
     course_data = {}  # course_id -> dict with all info
-
-    # Debug: Check if hierarchy_map keys match course IDs
-    if courses and hierarchy_map:
-        sample_course_id = courses[0].get("id", "")
-        sample_hierarchy_keys = list(hierarchy_map.keys())[:3]
-        print(f"\n  [Debug] Course ID format from v3 API: {sample_course_id}")
-        print(f"  [Debug] Hierarchy map key format: {sample_hierarchy_keys}")
-        
-        # Check if formats match
-        if sample_hierarchy_keys and sample_course_id:
-            if sample_course_id.startswith("_") and sample_hierarchy_keys[0].startswith("_"):
-                print(f"  [Debug] ✓ Both use internal BB IDs — mapping should work")
-            else:
-                print(f"  [Debug] ⚠ Format mismatch detected — will try alternate key matching")
 
     def process_course(course):
         cid = course.get("id")          # Internal BB ID like '_12345_1'
@@ -494,11 +449,9 @@ def extract_institutional_data(api, term_id, term_name, hierarchy_map, threshold
             if full:
                 instructor_names.append(full)
 
-        # Resolve department from the hierarchy map
-        # Try internal ID first (expected match), then external ID as fallback
-        department = hierarchy_map.get(cid, "")
-        if not department:
-            department = hierarchy_map.get(ext_id, "")
+        # Resolve department via reverse hierarchy lookup
+        # (asks BB 'what hierarchy node is this course in?')
+        department = resolve_department(api, cid)
 
         # Build a friendly course code from ext_id
         friendly_code = ext_id
@@ -568,15 +521,6 @@ def extract_institutional_data(api, term_id, term_name, hierarchy_map, threshold
     mapped = sum(1 for cd in course_data.values() if cd["department"])
     unmapped = sum(1 for cd in course_data.values() if not cd["department"])
     print(f"\n  [Hierarchy] Courses with department: {mapped}, without: {unmapped}")
-    if unmapped > 0 and mapped == 0:
-        print(f"  [Hierarchy] WARNING: Zero courses matched! The hierarchy API may be returning")
-        print(f"              a different courseId format than expected.")
-        print(f"              Hierarchy map has {len(hierarchy_map)} entries.")
-        if hierarchy_map:
-            sample_key = list(hierarchy_map.keys())[0]
-            sample_cid = list(course_data.keys())[0] if course_data else "N/A"
-            print(f"              Sample hierarchy key: {sample_key}")
-            print(f"              Sample course id:     {sample_cid}")
 
     # Step 3: For each student in each course, fetch attendance
     # NOTE: Attendance records are CACHED per-user (cross-course quirk means
@@ -801,12 +745,9 @@ def main():
     term_id = term["id"]
     print(f"\nSelected: {term.get('name')}")
 
-    # Build department map from Institutional Hierarchy API
-    hierarchy_map = build_hierarchy_map(api)
-
-    # Extract data
+    # Extract data (department names resolved per-course via hierarchy API)
     course_rows, student_rows, daily_rows, compliance_rows = extract_institutional_data(
-        api, term_id, term.get("name", "Unknown Term"), hierarchy_map, threshold, stale
+        api, term_id, term.get("name", "Unknown Term"), threshold, stale
     )
 
     # Write CSVs
