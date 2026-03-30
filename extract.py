@@ -13,7 +13,7 @@ Output: Four CSV files ready for import into the Excel reporting workbook.
 
 Usage:
   pip install requests
-  python bb_global_extract.py
+  python extract.py
 
 On first run, it creates a config.ini template for you to fill in.
 
@@ -67,7 +67,7 @@ OUTPUT_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attendan
 
 DEFAULT_THRESHOLD = 75          # Attendance % below which students are flagged
 STALE_DAYS        = 14          # Days since last attendance to flag as "Stale"
-MAX_WORKERS       = 4           # Parallel API threads (keep low to avoid 429s)
+MAX_WORKERS       = 3           # Parallel API threads (keep low to avoid 429s)
 
 # ── Institutional Hierarchy ──────────────────────────────────────────────────
 # The "All Departments" parent node ID in Blackboard's Institutional Hierarchy.
@@ -119,6 +119,14 @@ class BlackboardAPI:
         self.api_secret = api_secret
         self.token = None
         self.session = requests.Session()
+        self.api_call_count = 0  # Track total API calls
+
+        # ── Caches ──────────────────────────────────────────────────────
+        # These caches prevent redundant API calls for the same user/data.
+        # Without caching, the same instructor or student is looked up
+        # once per course they appear in, causing thousands of extra calls.
+        self._user_cache = {}          # userId → user details dict
+        self._attendance_cache = {}    # userId → list of attendance records (cross-course)
 
     def authenticate(self):
         """OAuth 2.0 Client Credentials flow."""
@@ -139,6 +147,7 @@ class BlackboardAPI:
         headers = {"Authorization": f"Bearer {self.token}"}
         max_retries = 5
         for attempt in range(max_retries):
+            self.api_call_count += 1
             resp = self.session.get(url, headers=headers, params=params, timeout=30)
             if resp.status_code == 429:
                 # Rate limited — read Retry-After header or default to 60s
@@ -207,12 +216,21 @@ class BlackboardAPI:
     def get_user_attendance_bulk(self, course_id, user_id):
         """Fetch ALL attendance records for a user (cross-course quirk).
         NOTE: This endpoint returns records from ALL courses, not just
-        the specified one. Caller must cross-reference with meetings lists."""
+        the specified one. Caller must cross-reference with meetings lists.
+        
+        CACHED: Since the endpoint returns cross-course data anyway,
+        we only need to call it once per user regardless of how many
+        courses they're enrolled in."""
+        if user_id in self._attendance_cache:
+            return self._attendance_cache[user_id]
         try:
-            return self._get_paged(
+            records = self._get_paged(
                 f"/learn/api/public/v1/courses/{course_id}/meetings/users/{user_id}"
             )
+            self._attendance_cache[user_id] = records
+            return records
         except Exception:
+            self._attendance_cache[user_id] = []
             return []
 
     def get_single_attendance(self, course_id, meeting_id, user_id):
@@ -226,10 +244,19 @@ class BlackboardAPI:
             return None
 
     def get_user_details(self, user_id):
-        """Fetch user profile details."""
+        """Fetch user profile details.
+        
+        CACHED: The same instructor or student may appear in many courses.
+        Without caching, a professor teaching 5 courses would be looked up
+        5 times; a student in 6 courses would be looked up 6 times."""
+        if user_id in self._user_cache:
+            return self._user_cache[user_id]
         try:
-            return self._get(f"/learn/api/public/v1/users/{user_id}")
+            data = self._get(f"/learn/api/public/v1/users/{user_id}")
+            self._user_cache[user_id] = data
+            return data
         except Exception:
+            self._user_cache[user_id] = {}
             return {}
 
     # ── Institutional Hierarchy ───────────────────────────────────────────
@@ -253,7 +280,13 @@ class BlackboardAPI:
             return []
 
     def get_hierarchy_node_courses(self, node_id):
-        """Fetch courses associated with a hierarchy node."""
+        """Fetch courses associated with a hierarchy node.
+        
+        Returns list of objects with fields:
+          - nodeId: the hierarchy node's primary ID
+          - courseId: the course's PRIMARY ID (internal BB ID like '_12345_1')
+          - isPrimary: boolean
+        """
         try:
             return self._get_paged(
                 f"/learn/api/public/v1/institutionalHierarchy/nodes/{node_id}/courses"
@@ -279,6 +312,9 @@ def build_hierarchy_map(api):
 
     Child-node courses inherit the TOP-LEVEL department name so that
     DE_2024 courses show up under 'Dual Enrolment', not a sub-label.
+    
+    The hierarchy API returns 'courseId' which is the BB internal primary ID
+    (e.g. '_12345_1'). This matches course.get("id") from the v3 courses endpoint.
     """
     print("\n[Hierarchy] Building department map from Institutional Hierarchy API...")
 
@@ -288,18 +324,28 @@ def build_hierarchy_map(api):
     dept_nodes = api.get_hierarchy_children(ALL_DEPARTMENTS_NODE_ID)
     print(f"  Found {len(dept_nodes)} department nodes")
 
+    if not dept_nodes:
+        print("  WARNING: No department nodes found! Check that the ALL_DEPARTMENTS_NODE_ID")
+        print(f"           ({ALL_DEPARTMENTS_NODE_ID}) is correct and has children.")
+        return course_dept_map
+
     def collect_courses(node_id, dept_name, depth=0):
         """Recursively collect courses for a node and all its children."""
         prefix = "    " * (depth + 1)
         # Get courses directly associated with this node
         assocs = api.get_hierarchy_node_courses(node_id)
         for a in assocs:
+            # The API returns 'courseId' = BB internal primary ID (e.g. '_12345_1')
             cid = a.get("courseId", "")
             if cid:
                 course_dept_map[cid] = dept_name
 
         if assocs:
             print(f"{prefix}  → {len(assocs)} courses")
+            # Debug: show first course ID format to verify it matches what we expect
+            if depth == 0 and assocs:
+                sample = assocs[0].get("courseId", "N/A")
+                print(f"{prefix}    (sample courseId format: {sample})")
 
         # Recurse into child nodes (e.g. DE_2024 under Dual Enrolment)
         children = api.get_hierarchy_children(node_id)
@@ -316,6 +362,12 @@ def build_hierarchy_map(api):
         collect_courses(nid, name)
 
     print(f"  Total courses mapped to departments: {len(course_dept_map)}")
+    
+    # Debug: show a few sample entries so user can verify the mapping
+    if course_dept_map:
+        samples = list(course_dept_map.items())[:3]
+        print(f"  Sample mappings: {samples}")
+    
     return course_dept_map
 
 
@@ -374,6 +426,11 @@ def extract_institutional_data(api, term_id, term_name, hierarchy_map, threshold
 
     This is the institutional-scale version of what bb-attendance-web does
     for a single student.
+    
+    API OPTIMIZATION:
+      - User details are cached (instructor appearing in 5 courses = 1 API call, not 5)
+      - Student attendance is cached (cross-course quirk means 1 call covers all courses)
+      - Parallel processing uses MAX_WORKERS=3 to stay under rate limits
     """
     print(f"\n{'='*60}")
     print(f"EXTRACTING INSTITUTIONAL ATTENDANCE DATA")
@@ -385,13 +442,29 @@ def extract_institutional_data(api, term_id, term_name, hierarchy_map, threshold
     print(f"  Found {len(courses)} courses")
 
     # Step 2: For each course, fetch meetings + memberships in parallel
+    # NOTE: Instructor user details are CACHED so repeated lookups are free
     print("\n[Step 2] Fetching meetings and memberships per course...")
+    print(f"  (Using {MAX_WORKERS} parallel workers, user details are cached)")
 
     course_data = {}  # course_id -> dict with all info
 
+    # Debug: Check if hierarchy_map keys match course IDs
+    if courses and hierarchy_map:
+        sample_course_id = courses[0].get("id", "")
+        sample_hierarchy_keys = list(hierarchy_map.keys())[:3]
+        print(f"\n  [Debug] Course ID format from v3 API: {sample_course_id}")
+        print(f"  [Debug] Hierarchy map key format: {sample_hierarchy_keys}")
+        
+        # Check if formats match
+        if sample_hierarchy_keys and sample_course_id:
+            if sample_course_id.startswith("_") and sample_hierarchy_keys[0].startswith("_"):
+                print(f"  [Debug] ✓ Both use internal BB IDs — mapping should work")
+            else:
+                print(f"  [Debug] ⚠ Format mismatch detected — will try alternate key matching")
+
     def process_course(course):
-        cid = course.get("id")
-        ext_id = course.get("courseId", cid)
+        cid = course.get("id")          # Internal BB ID like '_12345_1'
+        ext_id = course.get("courseId", cid)  # External ID like '2025_SP_AH_ENG_101_1'
         name = course.get("name", "Unknown")
 
         # Get meetings
@@ -402,7 +475,7 @@ def extract_institutional_data(api, term_id, term_name, hierarchy_map, threshold
         students = [m for m in members if m.get("courseRoleId") == "Student"]
         instructors = [m for m in members if m.get("courseRoleId") == "Instructor"]
 
-        # Look up instructor names
+        # Look up instructor names (CACHED — no duplicate API calls)
         instructor_names = []
         for inst in instructors:
             uid = inst.get("userId", "")
@@ -413,46 +486,35 @@ def extract_institutional_data(api, term_id, term_name, hierarchy_map, threshold
             if full:
                 instructor_names.append(full)
 
-        # Resolve department from the hierarchy map (built from Blackboard API)
+        # Resolve department from the hierarchy map
+        # Try internal ID first (expected match), then external ID as fallback
         department = hierarchy_map.get(cid, "")
+        if not department:
+            department = hierarchy_map.get(ext_id, "")
 
         # Build a friendly course code from ext_id
-        # Blackboard ext_ids look like "2025_SP_AH_ENG_101_1"
-        # Try to make it readable like "ENG 101-1"
-        # Strategy: skip the first 2-3 known prefix segments (year, term, dept code)
-        # then take subject + number + section.
         friendly_code = ext_id
         parts = ext_id.split("_")
         term_prefixes = {"SP", "FA", "SU", "S1", "S2", "WI"}
         if len(parts) >= 4:
             subj_parts = []
             for p in parts:
-                # Skip year (4 digits)
                 if p.isdigit() and len(p) == 4:
                     continue
-                # Skip known term prefixes
                 if p in term_prefixes:
                     continue
-                # Skip 2-3 letter uppercase codes that appear before the subject
-                # (these are typically department hierarchy codes like AH, BU, DE)
-                # Heuristic: if we haven't started collecting subject parts yet,
-                # and this is a short uppercase code, it's likely a dept prefix.
                 if not subj_parts and p.isalpha() and p.isupper() and len(p) <= 3:
-                    # Could be dept code or subject code — peek ahead to decide.
-                    # If the NEXT part is also alpha (subject code), skip this one.
                     idx = parts.index(p)
                     remaining = parts[idx+1:]
                     has_alpha_after = any(rp.isalpha() and len(rp) >= 2 for rp in remaining)
                     has_digit_after = any(rp.isdigit() and len(rp) == 3 for rp in remaining)
                     if has_alpha_after and has_digit_after:
-                        continue  # Skip this — it's a dept prefix before subject+number
-                # Collect subject code parts
+                        continue
                 if p.isalpha() and len(p) >= 2:
                     subj_parts.append(p)
                 elif p.isdigit() and subj_parts:
                     subj_parts.append(p)
             if len(subj_parts) >= 2:
-                # e.g. ['ENG', '101', '1'] -> 'ENG 101-1'
                 if len(subj_parts) >= 3:
                     friendly_code = f"{subj_parts[0]} {subj_parts[1]}-{subj_parts[2]}"
                 else:
@@ -478,12 +540,30 @@ def extract_institutional_data(api, term_id, term_name, hierarchy_map, threshold
             course_data[result["course_id"]] = result
             done += 1
             if done % 10 == 0:
-                print(f"  Processed {done}/{len(courses)} courses...")
+                print(f"  Processed {done}/{len(courses)} courses... (API calls so far: {api.api_call_count})")
 
-    print(f"  Completed all {len(courses)} courses")
+    print(f"  Completed all {len(courses)} courses (API calls so far: {api.api_call_count})")
+    
+    # Report hierarchy mapping results
+    mapped = sum(1 for cd in course_data.values() if cd["department"])
+    unmapped = sum(1 for cd in course_data.values() if not cd["department"])
+    print(f"\n  [Hierarchy] Courses with department: {mapped}, without: {unmapped}")
+    if unmapped > 0 and mapped == 0:
+        print(f"  [Hierarchy] WARNING: Zero courses matched! The hierarchy API may be returning")
+        print(f"              a different courseId format than expected.")
+        print(f"              Hierarchy map has {len(hierarchy_map)} entries.")
+        if hierarchy_map:
+            sample_key = list(hierarchy_map.keys())[0]
+            sample_cid = list(course_data.keys())[0] if course_data else "N/A"
+            print(f"              Sample hierarchy key: {sample_key}")
+            print(f"              Sample course id:     {sample_cid}")
 
     # Step 3: For each student in each course, fetch attendance
-    print("\n[Step 3] Fetching student attendance records...")
+    # NOTE: Attendance records are CACHED per-user (cross-course quirk means
+    #       one API call gets ALL records for a student across ALL courses).
+    #       User details are also CACHED from Step 2.
+    print(f"\n[Step 3] Fetching student attendance records...")
+    print(f"  (Attendance and user details are cached — repeat lookups are free)")
 
     course_summary_rows = []
     student_detail_rows = []
@@ -495,7 +575,7 @@ def extract_institutional_data(api, term_id, term_name, hierarchy_map, threshold
     for cid, cdata in course_data.items():
         course_count += 1
         if course_count % 10 == 0 or course_count == total_courses:
-            print(f"  Processing course {course_count}/{total_courses}: {cdata.get('friendly_code', cid)}...")
+            print(f"  Processing course {course_count}/{total_courses}: {cdata.get('friendly_code', cid)}... (API calls: {api.api_call_count})")
         meeting_ids = {str(m.get("id")): m for m in cdata["meetings"]}
         meeting_dates = {}
         for mid, m in meeting_ids.items():
@@ -524,7 +604,7 @@ def extract_institutional_data(api, term_id, term_name, hierarchy_map, threshold
             if stu_avail != "Yes":
                 continue  # Skip dropped students
 
-            # Fetch attendance for this student
+            # Fetch attendance for this student (CACHED — free if already fetched)
             records = api.get_user_attendance_bulk(cid, stu_uid)
 
             # Cross-reference: only keep records for THIS course's meetings
@@ -575,7 +655,7 @@ def extract_institutional_data(api, term_id, term_name, hierarchy_map, threshold
                 else:
                     students_below += 1
 
-            # Get student name
+            # Get student name (CACHED — free if already fetched for another course)
             udata = api.get_user_details(stu_uid)
             stu_name = f"{udata.get('name', {}).get('given', '')} {udata.get('name', {}).get('family', '')}".strip()
             stu_id = udata.get("studentId", udata.get("externalId", ""))
@@ -710,7 +790,7 @@ def main():
     )
 
     # Write CSVs
-    print("\n[Output] Writing CSV files...")
+    print(f"\n[Output] Writing CSV files...")
     write_csv("course_summary.csv", course_rows, [
         "term", "department", "course_code", "course_name", "instructor",
         "total_students", "avg_attendance_pct", "students_100_pct",
@@ -736,10 +816,15 @@ def main():
         "api_blocked", "no_attendance_recorded", "attendance_not_recent",
     ])
 
+    # Print API usage summary
     print(f"\n{'='*60}")
     print(f"EXTRACTION COMPLETE")
-    print(f"CSV files written to: {OUTPUT_DIR}")
-    print(f"Import these into the Excel workbook to populate the report.")
+    print(f"{'='*60}")
+    print(f"  Total API calls made: {api.api_call_count}")
+    print(f"  Users cached: {len(api._user_cache)}")
+    print(f"  Attendance records cached: {len(api._attendance_cache)} users")
+    print(f"  CSV files written to: {OUTPUT_DIR}")
+    print(f"  Import these into the Excel workbook to populate the report.")
     print(f"{'='*60}")
 
 
