@@ -96,11 +96,11 @@ python extract.py
 What happens:
 1. Authenticates with Blackboard
 2. Shows a list of terms — type the number for the term you want (e.g. `6` for Spring 2026)
-3. Builds a department map from the Institutional Hierarchy
-4. Fetches all courses, students, and attendance records
+3. Fetches all courses, their department (via hierarchy API), meetings, and memberships
+4. Fetches attendance records for every student (cached — each student is only looked up once)
 5. Saves four CSV files to the `attendance_data/` folder
 
-> **This step takes a while** (20–60 minutes for ~340 courses). Progress is printed as it goes. If you hit a `429 Too Many Requests` error, wait 15–30 minutes and run it again — it's a rate limit from Blackboard.
+> **This step takes a while** (30–60 minutes for ~340 courses). Progress is printed as it goes. The script automatically throttles API calls to avoid rate limits, but if you do hit a `429` error, wait 15–30 minutes and try again.
 
 ### Step 2 — Build the Excel report
 
@@ -147,15 +147,17 @@ Edit `extract_config.ini` to change:
 
 ## Institutional Hierarchy
 
-Departments are resolved using Blackboard's **Institutional Hierarchy API**, not by parsing course codes. The script:
+Departments are resolved using Blackboard's **Institutional Hierarchy API**, not by parsing course codes. For each course, the script calls:
 
-1. Reads the child nodes of the "All Departments" node
-2. For each department, fetches associated courses
-3. Recurses into sub-nodes (e.g. `DE_2024` and `DE_2025` under Dual Enrolment)
+```
+GET /learn/api/public/v1/courses/{courseId}/nodes?expand=node
+```
+
+This returns the hierarchy node(s) the course belongs to, including the node's `title` (department name) and `parentId`. The script identifies the top-level department by checking which node's `parentId` matches the "All Departments" root (`_172_1`).
 
 If a course isn't associated with any hierarchy node, its department column will be blank.
 
-The parent node ID is set in `extract.py` as `ALL_DEPARTMENTS_NODE_ID`. If your hierarchy root changes, update that value.
+The root node ID is set in `extract.py` as `ALL_DEPARTMENTS_NODE_ID = "_172_1"`. If your hierarchy root changes, update that value.
 
 ---
 
