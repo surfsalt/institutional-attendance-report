@@ -67,7 +67,9 @@ OUTPUT_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attendan
 
 DEFAULT_THRESHOLD = 75          # Attendance % below which students are flagged
 STALE_DAYS        = 14          # Days since last attendance to flag as "Stale"
-MAX_WORKERS       = 3           # Parallel API threads (keep low to avoid 429s)
+MAX_WORKERS       = 2           # Parallel API threads (keep very low to avoid 429s)
+BATCH_SIZE        = 20          # Process courses in batches of this size
+BATCH_DELAY       = 2           # Seconds to pause between batches
 
 # ── Institutional Hierarchy ──────────────────────────────────────────────────
 # The "All Departments" parent node ID in Blackboard's Institutional Hierarchy.
@@ -142,12 +144,18 @@ class BlackboardAPI:
         print(f"[Auth] Token acquired from {self.base_url}")
 
     def _get(self, path, params=None):
-        """Authenticated GET request with automatic 429 retry."""
+        """Authenticated GET request with automatic 429 retry and adaptive throttling."""
         url = f"{self.base_url}{path}"
         headers = {"Authorization": f"Bearer {self.token}"}
-        max_retries = 5
+        max_retries = 8
         for attempt in range(max_retries):
             self.api_call_count += 1
+            
+            # Adaptive throttle: add a small delay every N calls to avoid
+            # hitting the rate limit wall at ~190 courses
+            if self.api_call_count % 50 == 0:
+                time.sleep(1)  # Brief cooldown every 50 calls
+            
             resp = self.session.get(url, headers=headers, params=params, timeout=30)
             if resp.status_code == 429:
                 # Rate limited — read Retry-After header or default to 60s
@@ -532,17 +540,29 @@ def extract_institutional_data(api, term_id, term_name, hierarchy_map, threshold
             "department": department,
         }
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_course, c): c for c in courses}
-        done = 0
-        for future in as_completed(futures):
-            result = future.result()
-            course_data[result["course_id"]] = result
-            done += 1
-            if done % 10 == 0:
-                print(f"  Processed {done}/{len(courses)} courses... (API calls so far: {api.api_call_count})")
+    # Process in small batches with pauses between to avoid 429s.
+    # BB's rate limit resets on a rolling window — spacing requests out
+    # keeps us under the threshold instead of hitting a wall at ~190.
+    total = len(courses)
+    done = 0
+    for batch_start in range(0, total, BATCH_SIZE):
+        batch = courses[batch_start:batch_start + BATCH_SIZE]
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(process_course, c): c for c in batch}
+            for future in as_completed(futures):
+                result = future.result()
+                course_data[result["course_id"]] = result
+                done += 1
+                if done % 10 == 0 or done == total:
+                    print(f"  Processed {done}/{total} courses... (API calls so far: {api.api_call_count})")
+        
+        # Pause between batches to let the rate limit window slide
+        if batch_start + BATCH_SIZE < total:
+            print(f"  [Throttle] Pausing {BATCH_DELAY}s between batches...")
+            time.sleep(BATCH_DELAY)
 
-    print(f"  Completed all {len(courses)} courses (API calls so far: {api.api_call_count})")
+    print(f"  Completed all {total} courses (API calls so far: {api.api_call_count})")
     
     # Report hierarchy mapping results
     mapped = sum(1 for cd in course_data.values() if cd["department"])
