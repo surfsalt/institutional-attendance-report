@@ -2,13 +2,10 @@
 """
 Quick test: Can we resolve department names from the hierarchy API?
 
-This script authenticates, grabs a few courses from the selected term,
-and tries TWO approaches to see which one works:
-
-  A) TOP-DOWN: Get children of the 'All Departments' node
-  B) REVERSE:  For each course, ask 'what nodes is this course in?'
-
-Run this BEFORE updating extract.py so we know which approach to use.
+Tests THREE things:
+  A) List ALL top-level hierarchy nodes (to find the correct root)
+  B) Top-down: Get children of 'All Departments' node (the old approach)
+  C) Reverse: For each course, ask 'what nodes is this course in?'
 """
 
 import configparser
@@ -40,6 +37,15 @@ def api_get(session, base_url, token, path):
     return resp.json()
 
 
+def api_get_safe(session, base_url, token, path):
+    """GET that returns None on error instead of raising."""
+    try:
+        return api_get(session, base_url, token, path)
+    except Exception as e:
+        print(f"    FAILED: {e}")
+        return None
+
+
 def main():
     config = load_config()
     base_url = config["blackboard"]["base_url"].rstrip("/")
@@ -60,51 +66,72 @@ def main():
     token = resp.json()["access_token"]
     print(f"[Auth] OK\n")
 
-    # ── Test A: Top-down (current approach) ─────────────────────────────
+    # ── Test A: List ALL hierarchy nodes ─────────────────────────────────
     print("=" * 60)
-    print("TEST A: Top-down — get children of 'All Departments' node")
+    print("TEST A: List ALL hierarchy nodes (find the root)")
     print("=" * 60)
-    try:
-        data = api_get(session, base_url, token,
-                       f"/learn/api/public/v1/institutionalHierarchy/nodes/{ALL_DEPARTMENTS_NODE_ID}/children")
+    data = api_get_safe(session, base_url, token,
+                        "/learn/api/public/v1/institutionalHierarchy/nodes")
+    if data:
+        nodes = data.get("results", [])
+        print(f"  Total nodes found: {len(nodes)}")
+        for n in nodes:
+            parent = n.get("parentId", "NONE (root)")
+            print(f"    id: {n.get('id', 'N/A')}")
+            print(f"    title: {n.get('title', n.get('name', 'N/A'))}")
+            print(f"    externalId: {n.get('externalId', 'N/A')}")
+            print(f"    parentId: {parent}")
+            print()
+        
+        # Check paging
+        paging = data.get("paging", {})
+        if paging.get("nextPage"):
+            print(f"  (More pages available: {paging['nextPage']})")
+            # Fetch next pages
+            next_page = paging["nextPage"]
+            while next_page:
+                more = api_get_safe(session, base_url, token, next_page)
+                if more:
+                    extra = more.get("results", [])
+                    for n in extra:
+                        parent = n.get("parentId", "NONE (root)")
+                        print(f"    id: {n.get('id', 'N/A')}")
+                        print(f"    title: {n.get('title', n.get('name', 'N/A'))}")
+                        print(f"    externalId: {n.get('externalId', 'N/A')}")
+                        print(f"    parentId: {parent}")
+                        print()
+                    nodes.extend(extra)
+                    next_page = more.get("paging", {}).get("nextPage")
+                else:
+                    break
+            print(f"  Total nodes (all pages): {len(nodes)}")
+    else:
+        print("  Could not list nodes.")
+
+    # ── Test B: Top-down (current approach) ──────────────────────────────
+    print(f"\n{'=' * 60}")
+    print(f"TEST B: Top-down — children of node {ALL_DEPARTMENTS_NODE_ID}")
+    print("=" * 60)
+    data = api_get_safe(session, base_url, token,
+                        f"/learn/api/public/v1/institutionalHierarchy/nodes/{ALL_DEPARTMENTS_NODE_ID}/children")
+    if data:
         children = data.get("results", [])
         print(f"  Children found: {len(children)}")
         for c in children[:5]:
-            print(f"    - {c.get('name', c.get('title', 'N/A'))} (id: {c.get('id', 'N/A')})")
-        if len(children) > 5:
-            print(f"    ... and {len(children) - 5} more")
-        if not children:
-            print("  ⚠ No children found — this is why the department column is blank!")
-            print(f"    Node ID used: {ALL_DEPARTMENTS_NODE_ID}")
-            print(f"    Raw response: {json.dumps(data, indent=2)[:500]}")
-    except Exception as e:
-        print(f"  ✗ FAILED: {e}")
+            print(f"    - {c.get('title', c.get('name', 'N/A'))} (id: {c.get('id', 'N/A')})")
+    else:
+        print(f"  Could not fetch children (404 = node ID doesn't exist)")
 
-    # If children were found, try getting courses for the first one
-    if children:
-        first_node = children[0]
-        nid = first_node.get("id", "")
-        print(f"\n  Fetching courses for first department node '{first_node.get('name', 'N/A')}'...")
-        try:
-            data = api_get(session, base_url, token,
-                           f"/learn/api/public/v1/institutionalHierarchy/nodes/{nid}/courses")
-            courses = data.get("results", [])
-            print(f"  Courses found: {len(courses)}")
-            for c in courses[:3]:
-                print(f"    - courseId: {c.get('courseId', 'N/A')}, isPrimary: {c.get('isPrimary', 'N/A')}")
-        except Exception as e:
-            print(f"  ✗ FAILED: {e}")
-
-    # ── Test B: Reverse lookup (new approach) ───────────────────────────
+    # ── Test C: Reverse lookup (new approach) ────────────────────────────
     print(f"\n{'=' * 60}")
-    print("TEST B: Reverse — get hierarchy nodes FOR a course")
+    print("TEST C: Reverse — get hierarchy nodes FOR a course")
     print("=" * 60)
 
-    # First grab a few courses from the most recent term
+    # Grab a few courses from the most recent term
     print("  Fetching terms...")
     terms_data = api_get(session, base_url, token, "/learn/api/public/v1/terms")
     terms = terms_data.get("results", [])
-    terms.reverse()  # newest first
+    terms.reverse()
     print(f"  Found {len(terms)} terms, using: {terms[0].get('name', 'N/A')}")
 
     term_id = terms[0]["id"]
@@ -120,30 +147,32 @@ def main():
         print(f"  Course: {ext_id} — {name}")
         print(f"    Internal ID: {cid}")
 
-        try:
-            # Try with expand=node to get the full node details
-            data = api_get(session, base_url, token,
-                           f"/learn/api/public/v1/courses/{cid}/nodes?expand=node")
+        # Try with expand=node
+        data = api_get_safe(session, base_url, token,
+                            f"/learn/api/public/v1/courses/{cid}/nodes?expand=node")
+        if data:
             nodes = data.get("results", [])
             print(f"    Hierarchy nodes: {len(nodes)}")
             for n in nodes:
                 node_detail = n.get("node", {})
-                print(f"      - nodeId: {n.get('nodeId', 'N/A')}")
-                print(f"        title: {node_detail.get('title', 'N/A')}")
-                print(f"        externalId: {node_detail.get('externalId', 'N/A')}")
-                print(f"        parentId: {node_detail.get('parentId', 'N/A')}")
-                print(f"        isPrimary: {n.get('isPrimary', 'N/A')}")
-                if node_detail.get("parentId") == ALL_DEPARTMENTS_NODE_ID:
-                    print(f"        ✓ This IS a top-level department!")
+                print(f"      nodeId: {n.get('nodeId', 'N/A')}")
+                print(f"      title: {node_detail.get('title', 'N/A')}")
+                print(f"      externalId: {node_detail.get('externalId', 'N/A')}")
+                print(f"      parentId: {node_detail.get('parentId', 'N/A')}")
+                print(f"      isPrimary: {n.get('isPrimary', 'N/A')}")
             if not nodes:
-                print(f"      (no hierarchy nodes — course not assigned to any department)")
-        except Exception as e:
-            print(f"    ✗ FAILED: {e}")
-
+                # Also try without expand
+                data2 = api_get_safe(session, base_url, token,
+                                     f"/learn/api/public/v1/courses/{cid}/nodes")
+                if data2:
+                    nodes2 = data2.get("results", [])
+                    print(f"    Without expand: {len(nodes2)} nodes")
+                    for n in nodes2:
+                        print(f"      raw: {json.dumps(n)}")
         print()
 
     print("=" * 60)
-    print("DONE — check above to see which approach returns department data.")
+    print("DONE")
     print("=" * 60)
 
 
