@@ -606,6 +606,18 @@ def build_dashboard(wb, course_data, student_data):
     chart.set_categories(cats_ref)
     chart.legend = None
 
+    # Show department labels on x-axis, rotated to fit
+    chart.x_axis.tickLblPos = "low"
+    chart.x_axis.delete = False
+    from openpyxl.chart.text import RichText
+    from openpyxl.drawing.text import Paragraph, ParagraphProperties, CharacterProperties, RichTextProperties
+    chart.x_axis.txPr = RichText(
+        bodyPr=RichTextProperties(rot=-5400000),  # -90 degrees in EMUs (vertical)
+        p=[Paragraph(pPr=ParagraphProperties(
+            defRPr=CharacterProperties(sz=800)  # 8pt font
+        ), endParaRPr=CharacterProperties(sz=800))]
+    )
+
     # Color bars
     series = chart.series[0]
     series.graphicalProperties.solidFill = CHART_TEAL
@@ -653,6 +665,16 @@ def build_dashboard(wb, course_data, student_data):
     cats2 = Reference(ws, min_col=8, min_row=risk_start, max_row=risk_end)
     chart2.add_data(data2, titles_from_data=True)
     chart2.set_categories(cats2)
+
+    # Show department labels on x-axis, rotated to fit
+    chart2.x_axis.tickLblPos = "low"
+    chart2.x_axis.delete = False
+    chart2.x_axis.txPr = RichText(
+        bodyPr=RichTextProperties(rot=-5400000),  # -90 degrees
+        p=[Paragraph(pPr=ParagraphProperties(
+            defRPr=CharacterProperties(sz=800)
+        ), endParaRPr=CharacterProperties(sz=800))]
+    )
 
     # Color series
     colors2 = [GREEN_OK, ORANGE, RED_RISK]
